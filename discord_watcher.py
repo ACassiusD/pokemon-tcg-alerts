@@ -1,301 +1,408 @@
-"""
-Discord Channel Watcher
-Monitors a specific Discord channel for new messages and sends Pushover notifications.
-
-SETUP INSTRUCTIONS:
-1. Install dependencies: pip install playwright && playwright install
-2. Update DISCORD_CHANNEL_URL below with your target channel URL
-3. Run the script: python discord_watcher.py
-4. Log in to Discord in the browser window that opens
-5. Press ENTER in the terminal to start monitoring
-
-The script saves your login session in ./discord_profile so you only need to log in once.
-"""
-
 import subprocess
 import time
 import json
+import threading
+import sys
 from playwright.sync_api import sync_playwright
+from discord_utils import MESSAGE_SELECTOR, clean_discord_text, get_message_info, get_last_message_info
 
-# ============================================================================
-# CONFIGURATION - Update these values as needed
-# ============================================================================
+#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1360311340429742271" # Product-Links
+#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1368083628935876709" # Charmeleon-General
+#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557451466604624" # Amazon-CA
+DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1360311340429742271" # Product-Links 
 
-# Discord channel URL to monitor
-# Format: https://discord.com/channels/SERVER_ID/CHANNEL_ID
-# To get this: Right-click the channel in Discord > Copy Channel Link
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557386475733032"
+# Extract channel name from URL (fallback if we can't get it from page)
+def get_channel_name_from_url(url):
+    """Extract channel name from Discord URL or use a default."""
+    # Try to get from comment in URL
+    if "Amazon-CA" in url or "1373557451466604624" in url:
+        return "Amazon-CA"
+    elif "Product-Links" in url or "1360311340429742271" in url:
+        return "Product-Links"
+    elif "Charmeleon-General" in url or "1368083628935876709" in url:
+        return "Charmeleon-General"
+    return "Discord"
 
-# CSS selector to find message list items (entire message containers)
-# Using the list item container ensures we capture ALL content including embeds, links, images
-# This is more reliable than just messageContent which might miss embed content
-MESSAGE_LIST_ITEM_SELECTOR = 'li[id^="chat-messages"]'
+def get_server_name(page):
+    """Extract Discord server/guild name from the page title."""
+    try:
+        # Discord page title format: "Discord | #channel-name | Server Name"
+        # or "(unread) Discord | #channel-name | Server Name"
+        title = page.title()
+        if title and "Discord" in title:
+            # Split by "|" and get the last part (server name)
+            parts = title.split("|")
+            if len(parts) >= 3:
+                # Format: "Discord | #channel | Server Name"
+                server_name = parts[-1].strip()
+                if server_name and len(server_name) < 100:
+                    return server_name
+            elif len(parts) == 2:
+                # Format: "Discord | #channel" (no server name in title)
+                pass
+    except:
+        pass
+    
+    return None
 
-# Alternative: message content selector (fallback)
-# This finds just the text content divs
-MESSAGE_CONTENT_SELECTOR = '[class*="messageContent"]'
 
-# Pushover API credentials (keep these private!)
-PUSHOVER_TOKEN = "a79nbse49c1qhzi3be8wuay79ma8u7"
-PUSHOVER_USER = "uhk4gq35qtas36ynab7exwx119ekup"
-
-# ============================================================================
-# FUNCTIONS
-# ============================================================================
+def format_pushover_message(msg_info, server_name, channel_name):
+    """Format message for Pushover with nice formatting."""
+    embed_title = clean_discord_text(msg_info.get("embed_text", ""))
+    url = msg_info.get("url", "").strip()
+    message_text = clean_discord_text(msg_info.get("text", ""))
+    
+    # Build formatted message
+    lines = []
+    
+    # Header - use server name if available, otherwise "Discord"
+    server_display = server_name if server_name else "Discord"
+    lines.append(f"Alert from {server_display} in {channel_name}")
+    lines.append("")  # Empty line
+    
+    # Link title (if exists)
+    if embed_title:
+        lines.append(embed_title)
+        lines.append("")  # Empty line
+    
+    # Link (if exists)
+    if url:
+        lines.append(f"Link: {url}")
+        lines.append("")  # Empty line
+    
+    # Message text (if exists)
+    if message_text:
+        lines.append(f"Message: {message_text}")
+    
+    # Discord message link (if message ID exists)
+    message_id = msg_info.get("id", "")
+    if message_id:
+        # Extract channel ID and message ID from the message ID format
+        # Format: "chat-messages-{channel_id}-{message_id}"
+        try:
+            # Extract channel ID from DISCORD_CHANNEL_URL
+            # URL format: https://discord.com/channels/{server_id}/{channel_id}
+            url_parts = DISCORD_CHANNEL_URL.split("/")
+            if len(url_parts) >= 6:
+                server_id = url_parts[4]
+                channel_id = url_parts[5]
+                
+                # Extract actual message ID from message_id string
+                # Format: "chat-messages-{channel_id}-{actual_message_id}"
+                msg_id_parts = message_id.split("-")
+                if len(msg_id_parts) >= 4:
+                    actual_message_id = "-".join(msg_id_parts[3:])  # Get everything after "chat-messages-{channel_id}-"
+                    discord_message_url = f"https://discord.com/channels/{server_id}/{channel_id}/{actual_message_id}"
+                    lines.append("")  # Empty line
+                    lines.append(f"Discord Message: {discord_message_url}")
+        except:
+            pass
+    
+    return "\n".join(lines)
 
 def send_pushover_alert(message):
-    """
-    Send a Pushover notification with the detected message.
+    """Send a Pushover notification via curl."""
+    print(f"📱 [API CALL] Would send: {message}")
     
-    Args:
-        message (str): The message text to send in the notification
-    
-    The notification uses:
-    - Priority 2: High priority (bypasses quiet hours)
-    - Sound: "persistent" (repeating sound until acknowledged)
-    - Retry: 30 seconds (retry every 30 seconds if not acknowledged)
-    - Expire: 1800 seconds (30 minutes - stop retrying after this time)
-    """
     curl_cmd = [
         "curl", "--location", "https://api.pushover.net/1/messages.json",
         "--header", "Content-Type: application/json",
         "--data", json.dumps({
-            "token": PUSHOVER_TOKEN,
-            "user": PUSHOVER_USER,
+            "token": "a79nbse49c1qhzi3be8wuay79ma8u7",
+            "user": "uhk4gq35qtas36ynab7exwx119ekup",
             "message": message,
-            "priority": 2,          # High priority (bypasses quiet hours)
-            "sound": "persistent",   # Repeating sound until acknowledged
-            "retry": 30,             # Retry every 30 seconds
-            "expire": 1800            # Stop retrying after 30 minutes
+            "priority": 2,
+            "sound": "persistent",
+            "retry": 30,
+            "expire": 1800
         })
     ]
-    
-    # Execute the curl command and capture the result
     result = subprocess.run(curl_cmd, capture_output=True, text=True)
-    
     if result.returncode == 0:
         print("✓ Pushover notification sent successfully")
     else:
         print(f"✗ Failed to send notification: {result.stderr}")
 
-def get_message_text(elem):
-    """
-    Extract all text content from a message element, including embeds and links.
+def reset_monitoring(page):
+    """Reset monitoring by reloading page and showing last 5 messages again."""
+    print("\n" + "=" * 60)
+    print("🔄 Resetting monitoring...")
+    print("=" * 60)
     
-    For messages with embeds/links, Discord structures them differently:
-    - Regular messages: text is in messageContent div
-    - Bot messages with embeds: content might be in embed containers
-    - We need to check both to capture everything
+    # Reload the page
+    page.reload()
+    time.sleep(3)
     
-    Args:
-        elem: Playwright element handle (should be a message list item)
-    
-    Returns:
-        str: Full text content of the message, or None if empty/invalid
-    """
+    # Wait for messages to load
     try:
-        # Strategy: Get text from multiple sources and combine them
-        
-        # 1. Try to get text from messageContent div (regular message text)
-        content_text = ""
-        try:
-            content_elem = elem.query_selector(MESSAGE_CONTENT_SELECTOR)
-            if content_elem:
-                content_text = content_elem.inner_text().strip()
-        except:
-            pass
-        
-        # 2. Try to get text from embed containers (bot messages, rich embeds)
-        embed_texts = []
-        try:
-            # Discord embeds can have various class names, try common patterns
-            embed_selectors = [
-                '[class*="embed"]',
-                '[class*="Embed"]',
-                '[class*="embedInner"]',
-                '[class*="embedDescription"]',
-                '[class*="embedFields"]'
-            ]
-            for selector in embed_selectors:
-                embed_elements = elem.query_selector_all(selector)
-                for embed_elem in embed_elements:
-                    embed_text = embed_elem.inner_text().strip()
-                    if embed_text and embed_text not in embed_texts:
-                        embed_texts.append(embed_text)
-        except:
-            pass
-        
-        # 3. If we found embed text but no content text, use the full element text
-        # This handles cases where the message is entirely in an embed
-        if embed_texts and not content_text:
-            try:
-                full_text = elem.inner_text().strip()
-                # Filter out common Discord UI elements (timestamps, usernames, etc.)
-                # These usually contain patterns like "Today at" or "Yesterday at"
-                lines = full_text.split('\n')
-                filtered_lines = []
-                for line in lines:
-                    line = line.strip()
-                    # Skip lines that look like timestamps or metadata
-                    if line and not any(skip in line.lower() for skip in ['today at', 'yesterday at', '—', 'edited']):
-                        filtered_lines.append(line)
-                if filtered_lines:
-                    return '\n'.join(filtered_lines)
-            except:
-                pass
-        
-        # 4. Combine content text with embed text
-        all_text_parts = [content_text] + embed_texts
-        combined = '\n'.join([t for t in all_text_parts if t])
-        
-        return combined.strip() if combined.strip() else None
-        
-    except Exception:
+        page.wait_for_selector(MESSAGE_SELECTOR, timeout=15000)
+    except Exception as e:
+        print(f"✗ Error: Could not find messages. {e}")
         return None
-
-def get_non_empty_messages(page):
-    """
-    Find all message elements on the page and filter out empty ones.
     
-    Uses the full message list item container to capture ALL content including
-    embeds, links, images, and rich content that might be missed by just
-    looking at messageContent.
+    # Get all messages and display last 5
+    all_msgs = page.query_selector_all(MESSAGE_SELECTOR)
+    if not all_msgs:
+        print("ERROR: No messages found")
+        return None
     
-    Returns:
-        list: List of tuples (element, text) for non-empty messages
-    """
-    # Try to find message list items first (full message containers)
-    all_elements = page.query_selector_all(MESSAGE_LIST_ITEM_SELECTOR)
+    print(f"\n==={'='*60}===")
+    print(f"📋 Last 5 messages in channel:")
+    print(f"{'='*60}\n")
     
-    # If we don't find any, fall back to message content selector
-    if len(all_elements) == 0:
-        all_elements = page.query_selector_all(MESSAGE_CONTENT_SELECTOR)
+    # Get last 5 messages (oldest first, newest last)
+    last_5_msgs = all_msgs[-5:] if len(all_msgs) >= 5 else all_msgs
     
-    # Filter out empty messages and extract full text including embeds
-    non_empty_elements = []
-    for elem in all_elements:
-        text = get_message_text(elem)
-        if text:  # Only include messages that have actual text content
-            non_empty_elements.append((elem, text))
+    for i, msg_elem in enumerate(last_5_msgs, 1):
+        try:
+            msg_info = get_message_info(msg_elem)
+            
+            # Clean the text to remove Discord UI elements
+            cleaned_text = clean_discord_text(msg_info["text"])
+            cleaned_embed = clean_discord_text(msg_info.get("embed_text", ""))
+            
+            # Debug: print what we extracted
+            if msg_info["has_embed"]:
+                print(f"DEBUG msg #{len(last_5_msgs) - i + 1}: has_embed=True, embed_text='{msg_info.get('embed_text', '')[:50]}', cleaned_embed='{cleaned_embed[:50]}'")
+            
+            # Determine what alert would be sent (same logic as monitoring loop)
+            # For embeds, always prefer embed_text (title) over regular text
+            if msg_info["has_embed"] and cleaned_embed:
+                alert_msg = cleaned_embed[:150] + ("..." if len(cleaned_embed) > 150 else "")
+            elif cleaned_text:
+                alert_msg = cleaned_text[:150] + ("..." if len(cleaned_text) > 150 else "")
+            elif msg_info["has_image"] or msg_info["has_embed"]:
+                alert_msg = "New image/embed message"
+            else:
+                alert_msg = "(No content)"
+            
+            # Reverse numbering: newest (last) = #1, oldest (first) = #5
+            msg_num = len(last_5_msgs) - i + 1
+            
+            # Compact display
+            latest_label = " (latest)" if msg_num == 1 else ""
+            # Display message
+            print(f"#{msg_num}{latest_label} {'🖼️' if msg_info['has_image'] else ''}{'🔗' if msg_info['has_embed'] else ''} {alert_msg}")
+            # Show URL on separate line to avoid truncation
+            if msg_info.get("url"):
+                print(f"    URL: {msg_info['url']}")
+            
+            # Add separator between messages (not after the last one)
+            if i < len(last_5_msgs):
+                print(f"{'='*60}")
+        except Exception as e:
+            print(f"Message #{i}: Error parsing message - {e}")
+            # Add separator between messages (not after the last one)
+            if i < len(last_5_msgs):
+                print(f"{'='*60}")
     
-    return non_empty_elements
+    print(f"==={'='*60}===")
+    
+    # Get the newest message for tracking
+    last_msg = get_last_message_info(page)
+    if not last_msg:
+        return None
+    
+    last_seen_id = last_msg["id"]
+    print(f"\n✓ Monitoring reset! Now monitoring from message ID: {last_seen_id}")
+    
+    # Send API call for the latest message (for testing on slow channels)
+    print("Sending test API call for latest message...")
+    try:
+        server_name = get_server_name(page)
+        channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
+        msg_for_push = format_pushover_message(last_msg, server_name, channel_name)
+        
+        if last_msg.get("url"):
+            print(f"📎 URL: {last_msg['url']}")
+        else:
+            print("⚠ No URL found in message")
+        
+        send_pushover_alert(msg_for_push)
+    except Exception as e:
+        print(f"⚠ Error sending test API call: {e}")
+    
+    print("Watching for new messages... (Press ENTER to reset again)\n")
+    
+    return last_seen_id
 
 def main():
-    """
-    Main function that sets up the browser, monitors the Discord channel,
-    and sends notifications when new messages are detected.
-    """
-    # Launch browser with persistent context (saves login session)
-    # headless=False means you can see the browser window
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
-            user_data_dir="./discord_profile",  # Saves login session here
-            headless=False  # Set to True to hide browser window (not recommended for first login)
+            user_data_dir="./discord_profile",
+            headless=False
         )
         page = browser.new_page()
-        
-        # Step 1: Navigate to Discord login page
-        print("Opening Discord login page...")
         page.goto("https://discord.com/login")
         
-        # Step 2: Wait for user to log in manually
-        # The browser window will stay open so you can log in
-        print("\n" + "="*60)
-        print("ACTION REQUIRED: Log in to Discord in the browser window")
-        print("After logging in, come back here and press ENTER to continue")
-        print("="*60)
+        print("Log in manually, then press ENTER to continue...")
         input()
         
-        # Step 3: Navigate to the target channel
-        print(f"\nNavigating to channel: {DISCORD_CHANNEL_URL}")
+        print(f"Navigating to channel...")
         page.goto(DISCORD_CHANNEL_URL)
         
-        # Wait for page to fully load (Discord is a single-page app, needs time to render)
-        print("Waiting for channel to load...")
+        # Wait for page to load
         time.sleep(3)
         
-        # Step 4: Wait for messages to appear on the page
-        # This ensures the channel has loaded and messages are visible
-        # Try both selectors to be more robust
+        # Wait for messages to load
         try:
-            page.wait_for_selector(MESSAGE_LIST_ITEM_SELECTOR, timeout=10000)
-        except:
-            try:
-                page.wait_for_selector(MESSAGE_CONTENT_SELECTOR, timeout=5000)
-            except Exception as e:
-                print(f"✗ Error: Could not find messages on the page. {e}")
-                print("Make sure you're logged in and have access to this channel.")
-                return
-        
-        # Step 5: Get the initial (current) newest message
-        # We'll compare against this to detect when a NEW message appears
-        try:
-            non_empty_elements = get_non_empty_messages(page)
-            
-            if len(non_empty_elements) == 0:
-                print("ERROR: No messages found in the channel")
-                return
-            
-            # Get the LAST element (newest message) - this is what we'll watch
-            # Discord messages are ordered oldest to newest, so [-1] is the newest
-            last_seen_elem, last_seen = non_empty_elements[-1]
-            
-            print(f"\n✓ Connected successfully!")
-            print(f"  Monitoring {len(non_empty_elements)} messages in channel")
-            print(f"  Latest message: {last_seen[:80]}...")
-            print("\n" + "="*60)
-            print("WATCHING FOR NEW MESSAGES...")
-            print("(Press Ctrl+C to stop)")
-            print("="*60 + "\n")
-            
+            page.wait_for_selector(MESSAGE_SELECTOR, timeout=15000)
         except Exception as e:
-            print(f"ERROR: Failed to get initial message. {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"✗ Error: Could not find messages. {e}")
             return
         
-        # Step 6: Main monitoring loop
-        # Continuously check for new messages every 2 seconds
+        # Get all messages and display last 5
+        all_msgs = page.query_selector_all(MESSAGE_SELECTOR)
+        if not all_msgs:
+            print("ERROR: No messages found")
+            return
+        
+        print(f"\n==={'='*60}===")
+        print(f"📋 Last 5 messages in channel:")
+        print(f"{'='*60}\n")
+        
+        # Get last 5 messages (oldest first, newest last)
+        last_5_msgs = all_msgs[-5:] if len(all_msgs) >= 5 else all_msgs
+        
+        for i, msg_elem in enumerate(last_5_msgs, 1):
+            try:
+                msg_info = get_message_info(msg_elem)
+                
+                # Clean the text to remove Discord UI elements
+                cleaned_text = clean_discord_text(msg_info["text"])
+                cleaned_embed = clean_discord_text(msg_info.get("embed_text", ""))
+                
+                # Determine what alert would be sent (same logic as monitoring loop)
+                # For embeds, always prefer embed_text (title) over regular text
+                if msg_info["has_embed"] and cleaned_embed:
+                    alert_msg = cleaned_embed[:150] + ("..." if len(cleaned_embed) > 150 else "")
+                elif cleaned_text:
+                    alert_msg = cleaned_text[:150] + ("..." if len(cleaned_text) > 150 else "")
+                elif msg_info["has_image"] or msg_info["has_embed"]:
+                    alert_msg = "New image/embed message"
+                else:
+                    alert_msg = "(No content)"
+                
+                # Reverse numbering: newest (last) = #1, oldest (first) = #5
+                msg_num = len(last_5_msgs) - i + 1
+                
+                # Compact display
+                latest_label = " (latest)" if msg_num == 1 else ""
+                url_display = ""
+                if msg_info.get("url"):
+                    # Shorten URL for display (show first 50 chars)
+                    url_short = msg_info["url"][:50] + ("..." if len(msg_info["url"]) > 50 else "")
+                    url_display = f" | URL: {url_short}"
+                print(f"#{msg_num}{latest_label} {'🖼️' if msg_info['has_image'] else ''}{'🔗' if msg_info['has_embed'] else ''} {alert_msg}{url_display}")
+                
+                # Add separator between messages (not after the last one)
+                if i < len(last_5_msgs):
+                    print(f"{'='*60}")
+            except Exception as e:
+                print(f"#{i}: Error - {e}")
+                # Add separator between messages (not after the last one)
+                if i < len(last_5_msgs):
+                    print(f"{'='*60}")
+        
+        print(f"==={'='*60}===")
+        
+        # Get the newest message for tracking
+        last_msg = get_last_message_info(page)
+        last_seen_id = last_msg["id"]
+        
+        print(f"\n✓ Connected! Monitoring from message ID: {last_seen_id}")
+        
+        # Send API call for the latest message (for testing on slow channels)
+        print("Sending test API call for latest message...")
+        try:
+            server_name = get_server_name(page)
+            channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
+            msg_for_push = format_pushover_message(last_msg, server_name, channel_name)
+            
+            if last_msg.get("url"):
+                print(f"📎 URL: {last_msg['url']}")
+            else:
+                print("⚠ No URL found in message")
+            
+            send_pushover_alert(msg_for_push)
+        except Exception as e:
+            print(f"⚠ Error sending test API call: {e}")
+        
+        print("Watching for new messages... (Press ENTER to reset monitoring)\n")
+        
+        # Flag to track if reset was requested
+        reset_requested = threading.Event()
+        
+        # Thread to listen for ENTER keypress
+        def input_listener():
+            while True:
+                try:
+                    input()  # Wait for ENTER
+                    reset_requested.set()
+                except:
+                    break
+        
+        input_thread = threading.Thread(target=input_listener, daemon=True)
+        input_thread.start()
+        
         while True:
             try:
-                # Get all current messages from the page
-                non_empty_elements = get_non_empty_messages(page)
-                
-                if len(non_empty_elements) == 0:
-                    print("⚠ WARNING: No messages found (channel might have changed)")
-                    time.sleep(2)
+                # Check if reset was requested
+                if reset_requested.is_set():
+                    reset_requested.clear()
+                    new_last_seen_id = reset_monitoring(page)
+                    if new_last_seen_id:
+                        last_seen_id = new_last_seen_id
                     continue
                 
-                # Get the newest message (last element in the list)
-                current = non_empty_elements[-1][1]  # [1] gets the text from (elem, text) tuple
-                
-                # Compare with the last message we saw
-                # If they're different, a new message has appeared!
-                if current != last_seen:
-                    print(f"\n{'='*60}")
-                    print(f"🔔 NEW MESSAGE DETECTED!")
-                    print(f"Message: {current}")
-                    print(f"{'='*60}")
-                    
-                    # Send the notification
-                    send_pushover_alert(current)
-                    
-                    # Update our "last seen" message so we don't alert on it again
-                    last_seen = current
-                
-                # Wait 2 seconds before checking again
-                # Too frequent = more CPU usage, too slow = delayed notifications
+                current = get_last_message_info(page)
+                if not current:
+                    time.sleep(2)
+                    continue
+
+                # new message row detected by ID change
+                if current["id"] != last_seen_id:
+                    last_seen_id = current["id"]
+
+                    # Only alert if:
+                    #  - it has text, OR
+                    #  - it has an image, OR
+                    #  - it has an embed (link card / bot message / forwarded message)
+                    if current["text"] or current["has_image"] or current["has_embed"]:
+                        # Clean the text to remove Discord UI elements
+                        cleaned_text = clean_discord_text(current["text"])
+                        cleaned_embed = clean_discord_text(current.get("embed_text", ""))
+                        
+                        print("\n" + "=" * 60)
+                        print("🔔 NEW MESSAGE DETECTED!")
+                        icons = ""
+                        if current["has_image"]:
+                            icons += "🖼️ "
+                        if current["has_embed"]:
+                            icons += "🔗"
+                        if icons:
+                            print(f"{icons}")
+                        print("=" * 60)
+
+                        # Format message for Pushover
+                        server_name = get_server_name(page)
+                        channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
+                        msg_for_push = format_pushover_message(current, server_name, channel_name)
+                        
+                        if current.get("url"):
+                            print(f"📎 URL: {current['url']}")
+                        else:
+                            print("⚠ No URL found in message")
+                        
+                        send_pushover_alert(msg_for_push)
+
                 time.sleep(2)
-                
             except KeyboardInterrupt:
-                # User pressed Ctrl+C to stop
                 print("\n✓ Stopping watcher...")
                 break
             except Exception as e:
-                # Handle any unexpected errors gracefully
-                print(f"✗ Error in monitoring loop: {e}")
-                print("Continuing to monitor...")
-                time.sleep(5)  # Wait a bit longer before retrying after an error
+                print(f"✗ Error: {e}")
+                time.sleep(5)
 
 if __name__ == "__main__":
     main()
