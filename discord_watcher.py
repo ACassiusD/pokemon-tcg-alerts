@@ -24,12 +24,16 @@ from playwright.sync_api import sync_playwright
 # Discord channel URL to monitor
 # Format: https://discord.com/channels/SERVER_ID/CHANNEL_ID
 # To get this: Right-click the channel in Discord > Copy Channel Link
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557386475733032/1443044457590296688"
+DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557386475733032"
 
-# CSS selector to find message content elements
-# This selector finds all message content divs, including replies
-# We use the LAST element found (newest message) to detect new messages
-LAST_MESSAGE_SELECTOR = '[class*="messageContent"]'
+# CSS selector to find message list items (entire message containers)
+# Using the list item container ensures we capture ALL content including embeds, links, images
+# This is more reliable than just messageContent which might miss embed content
+MESSAGE_LIST_ITEM_SELECTOR = 'li[id^="chat-messages"]'
+
+# Alternative: message content selector (fallback)
+# This finds just the text content divs
+MESSAGE_CONTENT_SELECTOR = '[class*="messageContent"]'
 
 # Pushover API credentials (keep these private!)
 PUSHOVER_TOKEN = "a79nbse49c1qhzi3be8wuay79ma8u7"
@@ -74,26 +78,105 @@ def send_pushover_alert(message):
     else:
         print(f"✗ Failed to send notification: {result.stderr}")
 
+def get_message_text(elem):
+    """
+    Extract all text content from a message element, including embeds and links.
+    
+    For messages with embeds/links, Discord structures them differently:
+    - Regular messages: text is in messageContent div
+    - Bot messages with embeds: content might be in embed containers
+    - We need to check both to capture everything
+    
+    Args:
+        elem: Playwright element handle (should be a message list item)
+    
+    Returns:
+        str: Full text content of the message, or None if empty/invalid
+    """
+    try:
+        # Strategy: Get text from multiple sources and combine them
+        
+        # 1. Try to get text from messageContent div (regular message text)
+        content_text = ""
+        try:
+            content_elem = elem.query_selector(MESSAGE_CONTENT_SELECTOR)
+            if content_elem:
+                content_text = content_elem.inner_text().strip()
+        except:
+            pass
+        
+        # 2. Try to get text from embed containers (bot messages, rich embeds)
+        embed_texts = []
+        try:
+            # Discord embeds can have various class names, try common patterns
+            embed_selectors = [
+                '[class*="embed"]',
+                '[class*="Embed"]',
+                '[class*="embedInner"]',
+                '[class*="embedDescription"]',
+                '[class*="embedFields"]'
+            ]
+            for selector in embed_selectors:
+                embed_elements = elem.query_selector_all(selector)
+                for embed_elem in embed_elements:
+                    embed_text = embed_elem.inner_text().strip()
+                    if embed_text and embed_text not in embed_texts:
+                        embed_texts.append(embed_text)
+        except:
+            pass
+        
+        # 3. If we found embed text but no content text, use the full element text
+        # This handles cases where the message is entirely in an embed
+        if embed_texts and not content_text:
+            try:
+                full_text = elem.inner_text().strip()
+                # Filter out common Discord UI elements (timestamps, usernames, etc.)
+                # These usually contain patterns like "Today at" or "Yesterday at"
+                lines = full_text.split('\n')
+                filtered_lines = []
+                for line in lines:
+                    line = line.strip()
+                    # Skip lines that look like timestamps or metadata
+                    if line and not any(skip in line.lower() for skip in ['today at', 'yesterday at', '—', 'edited']):
+                        filtered_lines.append(line)
+                if filtered_lines:
+                    return '\n'.join(filtered_lines)
+            except:
+                pass
+        
+        # 4. Combine content text with embed text
+        all_text_parts = [content_text] + embed_texts
+        combined = '\n'.join([t for t in all_text_parts if t])
+        
+        return combined.strip() if combined.strip() else None
+        
+    except Exception:
+        return None
+
 def get_non_empty_messages(page):
     """
     Find all message elements on the page and filter out empty ones.
     
+    Uses the full message list item container to capture ALL content including
+    embeds, links, images, and rich content that might be missed by just
+    looking at messageContent.
+    
     Returns:
         list: List of tuples (element, text) for non-empty messages
     """
-    # Find all message content elements using our selector
-    all_elements = page.query_selector_all(LAST_MESSAGE_SELECTOR)
+    # Try to find message list items first (full message containers)
+    all_elements = page.query_selector_all(MESSAGE_LIST_ITEM_SELECTOR)
     
-    # Filter out empty messages (some elements might be empty divs or placeholders)
+    # If we don't find any, fall back to message content selector
+    if len(all_elements) == 0:
+        all_elements = page.query_selector_all(MESSAGE_CONTENT_SELECTOR)
+    
+    # Filter out empty messages and extract full text including embeds
     non_empty_elements = []
     for elem in all_elements:
-        try:
-            text = elem.inner_text().strip()
-            if text:  # Only include messages that have actual text content
-                non_empty_elements.append((elem, text))
-        except Exception:
-            # If we can't read the element, skip it
-            pass
+        text = get_message_text(elem)
+        if text:  # Only include messages that have actual text content
+            non_empty_elements.append((elem, text))
     
     return non_empty_elements
 
@@ -133,12 +216,16 @@ def main():
         
         # Step 4: Wait for messages to appear on the page
         # This ensures the channel has loaded and messages are visible
+        # Try both selectors to be more robust
         try:
-            page.wait_for_selector(LAST_MESSAGE_SELECTOR, timeout=10000)
-        except Exception as e:
-            print(f"✗ Error: Could not find messages on the page. {e}")
-            print("Make sure you're logged in and have access to this channel.")
-            return
+            page.wait_for_selector(MESSAGE_LIST_ITEM_SELECTOR, timeout=10000)
+        except:
+            try:
+                page.wait_for_selector(MESSAGE_CONTENT_SELECTOR, timeout=5000)
+            except Exception as e:
+                print(f"✗ Error: Could not find messages on the page. {e}")
+                print("Make sure you're logged in and have access to this channel.")
+                return
         
         # Step 5: Get the initial (current) newest message
         # We'll compare against this to detect when a NEW message appears
