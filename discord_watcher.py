@@ -3,13 +3,16 @@ import time
 import json
 import threading
 import sys
+import os
+import argparse
 from playwright.sync_api import sync_playwright
 from discord_utils import MESSAGE_SELECTOR, clean_discord_text, get_message_info, get_last_message_info
 
-#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1360311340429742271" # Product-Links
-#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1368083628935876709" # Charmeleon-General
-#DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557451466604624" # Amazon-CA
-DISCORD_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1360311340429742271" # Product-Links 
+# Default values (can be overridden by command-line arguments)
+#DEFAULT_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1360311340429742271" # Product-Links
+#DEFAULT_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373557427966050304" # Costco-Links
+DEFAULT_CHANNEL_URL = "https://discord.com/channels/1359582105591353376/1373855048190394428" # Pokemon Center
+DEFAULT_PROFILE_DIR = "./discord_profile" 
 
 # Extract channel name from URL (fallback if we can't get it from page)
 def get_channel_name_from_url(url):
@@ -46,7 +49,7 @@ def get_server_name(page):
     return None
 
 
-def format_pushover_message(msg_info, server_name, channel_name):
+def format_pushover_message(msg_info, server_name, channel_name, channel_url):
     """Format message for Pushover with nice formatting."""
     embed_title = clean_discord_text(msg_info.get("embed_text", ""))
     url = msg_info.get("url", "").strip()
@@ -80,9 +83,9 @@ def format_pushover_message(msg_info, server_name, channel_name):
         # Extract channel ID and message ID from the message ID format
         # Format: "chat-messages-{channel_id}-{message_id}"
         try:
-            # Extract channel ID from DISCORD_CHANNEL_URL
+            # Extract channel ID from channel_url
             # URL format: https://discord.com/channels/{server_id}/{channel_id}
-            url_parts = DISCORD_CHANNEL_URL.split("/")
+            url_parts = channel_url.split("/")
             if len(url_parts) >= 6:
                 server_id = url_parts[4]
                 channel_id = url_parts[5]
@@ -123,7 +126,7 @@ def send_pushover_alert(message):
     else:
         print(f"✗ Failed to send notification: {result.stderr}")
 
-def reset_monitoring(page):
+def reset_monitoring(page, channel_url):
     """Reset monitoring by reloading page and showing last 5 messages again."""
     print("\n" + "=" * 60)
     print("🔄 Resetting monitoring...")
@@ -210,8 +213,8 @@ def reset_monitoring(page):
     print("Sending test API call for latest message...")
     try:
         server_name = get_server_name(page)
-        channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
-        msg_for_push = format_pushover_message(last_msg, server_name, channel_name)
+        channel_name = get_channel_name_from_url(channel_url)
+        msg_for_push = format_pushover_message(last_msg, server_name, channel_name, channel_url)
         
         if last_msg.get("url"):
             print(f"📎 URL: {last_msg['url']}")
@@ -226,20 +229,44 @@ def reset_monitoring(page):
     
     return last_seen_id
 
-def main():
+def main(channel_url=None, profile_dir=None):
+    # Use provided values or defaults
+    if channel_url is None:
+        channel_url = DEFAULT_CHANNEL_URL
+    if profile_dir is None:
+        profile_dir = DEFAULT_PROFILE_DIR
+    
+    # Extract channel name for display
+    channel_name = get_channel_name_from_url(channel_url)
+    print(f"\n{'='*60}")
+    print(f"🚀 Starting Discord Watcher")
+    print(f" channel: {channel_name}")
+    print(f"📁 Profile: {profile_dir}")
+    print(f"{'='*60}\n")
+    
     with sync_playwright() as p:
         browser = p.chromium.launch_persistent_context(
-            user_data_dir="./discord_profile",
+            user_data_dir=profile_dir,
             headless=False
         )
         page = browser.new_page()
-        page.goto("https://discord.com/login")
         
-        print("Log in manually, then press ENTER to continue...")
-        input()
-        
+        # Try going directly to the channel first (if already logged in)
         print(f"Navigating to channel...")
-        page.goto(DISCORD_CHANNEL_URL)
+        page.goto(channel_url)
+        time.sleep(3)
+        
+        # Check if we're logged in by looking for the login page or messages
+        current_url = page.url
+        if "login" in current_url.lower():
+            # Not logged in - need to log in manually
+            print("Not logged in. Please log in manually in the browser window, then press ENTER to continue...")
+            input()
+            # Try again after login
+            page.goto(channel_url)
+            time.sleep(3)
+        else:
+            print("✓ Already logged in! Using saved session.")
         
         # Wait for page to load
         time.sleep(3)
@@ -316,8 +343,8 @@ def main():
         print("Sending test API call for latest message...")
         try:
             server_name = get_server_name(page)
-            channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
-            msg_for_push = format_pushover_message(last_msg, server_name, channel_name)
+            channel_name = get_channel_name_from_url(channel_url)
+            msg_for_push = format_pushover_message(last_msg, server_name, channel_name, channel_url)
             
             if last_msg.get("url"):
                 print(f"📎 URL: {last_msg['url']}")
@@ -350,7 +377,7 @@ def main():
                 # Check if reset was requested
                 if reset_requested.is_set():
                     reset_requested.clear()
-                    new_last_seen_id = reset_monitoring(page)
+                    new_last_seen_id = reset_monitoring(page, channel_url)
                     if new_last_seen_id:
                         last_seen_id = new_last_seen_id
                     continue
@@ -386,8 +413,8 @@ def main():
 
                         # Format message for Pushover
                         server_name = get_server_name(page)
-                        channel_name = get_channel_name_from_url(DISCORD_CHANNEL_URL)
-                        msg_for_push = format_pushover_message(current, server_name, channel_name)
+                        channel_name = get_channel_name_from_url(channel_url)
+                        msg_for_push = format_pushover_message(current, server_name, channel_name, channel_url)
                         
                         if current.get("url"):
                             print(f"📎 URL: {current['url']}")
@@ -405,5 +432,17 @@ def main():
                 time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Discord Channel Watcher - Monitor specific Discord channels for new messages')
+    parser.add_argument('--channel', '-c', type=str, help='Discord channel URL to monitor')
+    parser.add_argument('--profile', '-p', type=str, help='Browser profile directory (default: ./discord_profile)')
+    
+    args = parser.parse_args()
+    
+    # Get channel URL from args, environment variable, or default
+    channel_url = args.channel or os.getenv('DISCORD_CHANNEL_URL') or DEFAULT_CHANNEL_URL
+    
+    # Get profile directory from args, environment variable, or default
+    profile_dir = args.profile or os.getenv('DISCORD_PROFILE_DIR') or DEFAULT_PROFILE_DIR
+    
+    main(channel_url=channel_url, profile_dir=profile_dir)
 
